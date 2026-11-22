@@ -14,13 +14,17 @@ Tabs
   Staff assistant  - chat; every message passes the gateway, with a live gateway trace
   Check a prompt   - security analyst view: each step, highlighted personal data, masked text
   Batch test       - governance team: run the 20-prompt test set or upload a CSV
-  Audit log        - decisions made in this session (masked text only)
+  Risk dashboard   - key risk indicators (KRIs): injection attempts, personal data by category
+  Audit log        - decisions made in this session (masked text only, Hong Kong time)
 """
 
 import html
+import re
 import time
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -50,6 +54,8 @@ MAX_CHARS = 1500          # longest prompt accepted (keeps inputs within the mod
 MAX_BATCH_ROWS = 100      # longest CSV accepted in the batch test tab
 SAMPLE_TEST_FILE = Path(__file__).parent / "test_cases" / "live_test_cases.csv"
 AUDIT_PREVIEW_CHARS = 90  # length of the masked prompt preview in the audit log
+DISPLAY_TIMEZONE = "Asia/Hong Kong"   # audit times are shown in this zone (server clock is UTC)
+TIME_LABEL = "Time (HKT)"
 
 # Chat tab settings
 USE_LOCAL_ASSISTANT = True    # small Hugging Face chat model as the demo assistant
@@ -79,6 +85,47 @@ PII_LABELS = {
     "BITCOINADDRESS", "ETHEREUMADDRESS", "LITECOINADDRESS", "VEHICLEVIN", "VEHICLEVRM",
 }
 
+# Personal-data sub-types: the PII model already returns these entity labels, so the
+# dashboard only groups them into business categories (no extra model is needed)
+PII_CATEGORIES = {
+    "Name": {"PER", "NAME", "FULLNAME", "FIRSTNAME", "MIDDLENAME", "LASTNAME"},
+    "Contact details": {"EMAIL", "PHONENUMBER", "PHONE_NUMBER"},
+    "Address & location": {"STREET", "STREETADDRESS", "BUILDINGNUMBER", "SECONDARYADDRESS", "ZIPCODE",
+                           "NEARBYGPSCOORDINATE"},
+    "Card & account numbers": {"CREDITCARDNUMBER", "CREDITCARDCVV", "MASKEDNUMBER", "ACCOUNTNUMBER",
+                               "IBAN", "BIC", "PIN"},
+    "ID number & date of birth": {"SSN", "DOB"},
+    "Login credentials": {"USERNAME", "PASSWORD"},
+    "Device & network IDs": {"IP", "IPV4", "IPV6", "MAC", "PHONEIMEI"},
+    "Crypto wallet": {"BITCOINADDRESS", "ETHEREUMADDRESS", "LITECOINADDRESS"},
+    "Vehicle ID": {"VEHICLEVIN", "VEHICLEVRM"},
+}
+HIGH_SENSITIVITY = {"Card & account numbers", "ID number & date of birth", "Login credentials"}
+
+# Injection sub-types: the fine-tuned model is binary (safe / injection), so it cannot name the
+# technique. These keyword rules only tag prompts the model has already BLOCKED and are shown
+# as "indicative" on the dashboard.
+INJECTION_TECHNIQUES = {
+    "Instruction override": r"\b(ignore|disregard|forget|override|bypass)\b",
+    "Role-play / persona": r"\b(you are now|pretend|act as|role-?play|DAN)\b",
+    "Fake system or authority message": r"\b(system override|system message|developer mode|new instruction|from management|administrator)\b",
+    "Data extraction": r"\b(system prompt|reveal|password|api keys?|confidential|account history)\b",
+    "Safety-rule removal": r"\b(no rules|without (any )?(safety|restrictions)|unrestricted|safety checks)\b",
+    "Obfuscation / translation": r"\b(translate|base64|encode|decode|reverse)\b",
+}
+# Model confidence bands for blocked prompts (highest first)
+CONFIDENCE_BANDS = [("Very high (≥ 99%)", 0.99), ("High (90–99%)", 0.90), ("Moderate (50–90%)", BLOCK_THRESHOLD)]
+
+# Key risk indicators: (amber above, red above). Illustrative limits for the proof of concept;
+# PrimeCredit would set its own risk appetite.
+KRI_LIMITS = {
+    "injection_rate": (0.02, 0.05),
+    "pii_rate": (0.10, 0.20),
+    "high_sensitivity_rate": (0.02, 0.05),
+    "avg_check_time": (1.0, 2.0),
+}
+RAG_COLOR = {"Green": "#12B76A", "Amber": "#F79009", "Red": "#D92D20"}
+
 # Colours, labels and the action taken for each decision
 DECISION_STYLE = {
     "BLOCK": {"color": "#B42318", "bg": "#FEF3F2", "icon": "🚫", "text": "Not sent, possible injection",
@@ -98,7 +145,7 @@ CSS = """
 .stApp, [data-testid="stMarkdownContainer"], [data-testid="stCaptionContainer"], .stTabs p,
 .stButton p, .stDownloadButton p, .stFormSubmitButton p, [data-testid="stWidgetLabel"] p,
 .gw-top, .gw-kpis, .gw-panel, .gw-card, .gw-flow, .gw-text, .gw-table, .gw-badge, .gw-muted,
-.gw-trace, .gw-footer {
+.gw-trace, .gw-footer, .gw-bars, .gw-note {
     font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;}
 .block-container {padding-top: 1.2rem; padding-bottom: 1rem; max-width: 1320px;}
 #MainMenu, footer {visibility: hidden;}
@@ -170,6 +217,16 @@ h1, h2, h3, h4, h5 {font-family: 'Inter', 'Segoe UI', sans-serif; color: #0B1F3A
     letter-spacing: 0.04em; border-bottom: 1px solid #E4E7EC; padding: 0.45rem 0.5rem;}
 .gw-table td {border-bottom: 1px solid #F2F4F7; padding: 0.55rem 0.5rem; vertical-align: top; color: #101828;}
 .gw-big {font-weight: 700; color: #0B1F3A; font-size: 1.05rem;}
+
+/* Risk dashboard */
+.gw-rag {display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px;}
+.gw-bars {width: 100%; border-collapse: collapse; font-size: 0.84rem;}
+.gw-bars td {padding: 0.3rem 0.4rem; vertical-align: middle; color: #101828;}
+.gw-bars td.lbl {width: 42%;}
+.gw-bars td.num {width: 12%; text-align: right; font-weight: 600;}
+.gw-hbar {height: 10px; border-radius: 999px; background: #F2F4F7;}
+.gw-hbar div {height: 10px; border-radius: 999px;}
+.gw-note {font-size: 0.74rem; color: #667085; margin-top: 0.4rem;}
 
 /* Stacked distribution bar (batch) */
 .gw-dist {display: flex; height: 14px; border-radius: 999px; overflow: hidden; margin: 0.3rem 0 0.4rem 0;}
@@ -356,14 +413,16 @@ def gateway_chat_reply(message, injection_clf, pii_ner, settings):
 # Batch evaluation (same columns and calculations as the evaluated version)
 # ---------------------------------------------------------------------------
 def run_batch(df, injection_clf, pii_ner):
-    """Check every row of a CSV and return the results table (also used for the CSV download)."""
-    rows, progress = [], st.progress(0.0, text="Checking prompts ...")
+    """Check every row of a CSV. Returns the results table (used for the CSV download, same columns
+    as the evaluated version) and one event per checked prompt for the risk dashboard."""
+    rows, events, progress = [], [], st.progress(0.0, text="Checking prompts ...")
     for i, text in enumerate(df["text"].astype(str)):
         if validate_prompt(text):
             rows.append({"decision": "SKIPPED", "injection_pred": None, "pii_pred": None,
                          "injection_prob": None})
         else:
             r = check_prompt(text, injection_clf, pii_ner)
+            events.append(make_event("Batch test", text, r))
             rows.append({"decision": r["decision"],
                          "injection_pred": int(r["injection_prob"] >= BLOCK_THRESHOLD),
                          "pii_pred": int(bool(r["entities"])),
@@ -375,7 +434,7 @@ def run_batch(df, injection_clf, pii_ner):
     for check in ("injection", "pii"):
         if f"expected_{check}" in out.columns:
             out[f"{check}_correct"] = out[f"expected_{check}"] == out[f"{check}_pred"]
-    return out
+    return out, events
 
 
 def batch_accuracy(out):
@@ -404,22 +463,66 @@ def batch_error(df):
 # Session audit log (masked text only, so no personal data is kept)
 # ---------------------------------------------------------------------------
 def now_text():
-    return datetime.now().strftime("%H:%M:%S")
+    """Current time in Hong Kong. Streamlit Cloud servers run on UTC, so the zone is set here."""
+    try:
+        tz = ZoneInfo(DISPLAY_TIMEZONE)
+    except Exception:
+        tz = timezone(timedelta(hours=8))      # fallback if the time zone database is missing
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def log_event(channel, text, result):
+def pii_category(label):
+    for category, labels in PII_CATEGORIES.items():
+        if label in labels:
+            return category
+    return "Other"
+
+
+def injection_techniques(text):
+    """Indicative technique tags from keyword rules (the model itself only says injection / safe)."""
+    tags = [name for name, pattern in INJECTION_TECHNIQUES.items() if re.search(pattern, text, re.IGNORECASE)]
+    return tags or ["Other / unclassified"]
+
+
+def confidence_band(prob):
+    for label, low in CONFIDENCE_BANDS:
+        if prob >= low:
+            return label
+    return "Below threshold"
+
+
+def make_event(channel, text, result):
+    """One record per checked prompt. Only masked text is kept; fields starting with '_' are for the
+    dashboard and are not shown in the audit table."""
     preview = mask_text(text, result["entities"]).replace("\n", " ")
     if len(preview) > AUDIT_PREVIEW_CHARS:
         preview = preview[:AUDIT_PREVIEW_CHARS] + " ..."
-    st.session_state.setdefault("audit", []).append({
-        "Time": now_text(),
+    types = [clean_label(e["entity_group"]) for e in result["entities"]]
+    blocked = result["decision"] == "BLOCK"
+    techniques = injection_techniques(text) if blocked else []
+    return {
+        TIME_LABEL: now_text(),
         "Channel": channel,
         "Decision": result["decision"],
         "Injection probability": round(result["injection_prob"], 3),
+        "Injection technique (indicative)": ", ".join(techniques) or "-",
         "Personal data": pii_types(result["entities"]) or "-",
+        "Data category": ", ".join(sorted({pii_category(t) for t in types})) or "-",
         "Check time (s)": round(result["t_injection"] + result["t_pii"], 2),
         "Prompt (masked)": preview,
-    })
+        "_types": types,
+        "_techniques": techniques,
+        "_band": confidence_band(result["injection_prob"]) if blocked else None,
+    }
+
+
+def log_event(channel, text, result):
+    st.session_state.setdefault("audit", []).append(make_event(channel, text, result))
+
+
+def visible(records):
+    """Audit records without the internal '_' fields (for display and export)."""
+    return pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in records])
 
 
 def session_stats():
@@ -540,6 +643,53 @@ def distribution_bar_html(counts, total):
     return f"<div class='gw-dist'>{segments}</div><div class='gw-muted'>{legend}</div>"
 
 
+def rag_status(value, limits):
+    amber, red = limits
+    return "Green" if value <= amber else "Amber" if value <= red else "Red"
+
+
+def kri_card(label, value_text, status, sub):
+    dot = f"<span class='gw-rag' style='background:{RAG_COLOR[status]}'></span>"
+    return (f"<div class='gw-kpi'><div class='lbl'>{label}</div><div class='val'>{value_text}</div>"
+            f"<div class='sub'>{dot}{status} · {sub}</div></div>")
+
+
+def kri_cards_html(events):
+    n = len(events)
+    blocked = sum(e["Decision"] == "BLOCK" for e in events)
+    with_pii = sum(bool(e["_types"]) for e in events)
+    high = sum(bool({pii_category(t) for t in e["_types"]} & HIGH_SENSITIVITY) for e in events)
+    avg_time = sum(e["Check time (s)"] for e in events) / n
+    rates = {"injection_rate": blocked / n, "pii_rate": with_pii / n, "high_sensitivity_rate": high / n}
+    lim = KRI_LIMITS
+    cards = [
+        ("Injection attempt rate", f"{rates['injection_rate']:.0%}", "injection_rate",
+         f"{blocked} of {n} prompts blocked"),
+        ("Personal-data exposure rate", f"{rates['pii_rate']:.0%}", "pii_rate",
+         f"{with_pii} of {n} prompts contained personal data"),
+        ("High-sensitivity data rate", f"{rates['high_sensitivity_rate']:.0%}", "high_sensitivity_rate",
+         f"{high} prompt(s) with card, account, ID or login data"),
+    ]
+    html_cards = "".join(
+        kri_card(label, text, rag_status(rates[key], lim[key]),
+                 f"{sub} · amber > {lim[key][0]:.0%}, red > {lim[key][1]:.0%}")
+        for label, text, key, sub in cards)
+    html_cards += kri_card("Average check time", f"{avg_time:.2f}s", rag_status(avg_time, lim["avg_check_time"]),
+                           f"operational · amber > {lim['avg_check_time'][0]:.0f}s")
+    return f"<div class='gw-kpis' style='grid-template-columns:repeat(4,minmax(0,1fr))'>{html_cards}</div>"
+
+
+def bar_list_html(pairs, color):
+    """Simple horizontal bar list: [(label, value), ...]."""
+    if not pairs:
+        return "<div class='gw-note'>None in the selected data.</div>"
+    top = max(v for _, v in pairs) or 1
+    rows = "".join(f"<tr><td class='lbl'>{html.escape(str(k))}</td><td><div class='gw-hbar'><div style='width:"
+                   f"{v / top * 100:.0f}%;background:{color}'></div></div></td><td class='num'>{v}</td></tr>"
+                   for k, v in pairs)
+    return f"<table class='gw-bars'>{rows}</table>"
+
+
 def fill_draft(text):
     """Example button: put the example text into the message box (not sent yet)."""
     st.session_state["draft"] = text
@@ -602,8 +752,8 @@ with st.sidebar:
                 f"{badge('REVIEW')} personal data found, not sent<br><br>"
                 f"{badge('ALLOW')} no issue, sent to assistant", unsafe_allow_html=True)
 
-tab_overview, tab_chat, tab_single, tab_batch, tab_audit = st.tabs(
-    ["Overview", "💬 Staff assistant", "🔍 Check a prompt", "📊 Batch test", "🗂️ Audit log"])
+tab_overview, tab_chat, tab_single, tab_batch, tab_kri, tab_audit = st.tabs(
+    ["Overview", "💬 Staff assistant", "🔍 Check a prompt", "📊 Batch test", "📈 Risk dashboard", "🗂️ Audit log"])
 
 # ----- Overview: for management -----
 with tab_overview:
@@ -822,7 +972,8 @@ with tab_batch:
         if error:
             st.error(error)
         else:
-            st.session_state["batch"] = {"out": run_batch(new_df, injection_clf, pii_ner), "source": source_name}
+            out, events = run_batch(new_df, injection_clf, pii_ner)
+            st.session_state["batch"] = {"out": out, "events": events, "source": source_name}
 
     batch = st.session_state.get("batch")
     if batch:
@@ -851,20 +1002,80 @@ with tab_batch:
         st.download_button("⬇️ Download results (CSV)", out.to_csv(index=False),
                            file_name="live_app_results.csv", mime="text/csv")
 
+# ----- Risk dashboard: key risk indicators -----
+with tab_kri:
+    st.markdown("#### Key risk indicators")
+    st.caption("Built from the prompts screened in this session. Personal-data sub-types come directly from the "
+               "PII model's labels; injection sub-types are indicative keyword tags on prompts the model blocked.")
+    interactive = st.session_state.get("audit", [])
+    batch_events = (st.session_state.get("batch") or {}).get("events", [])
+    source = st.radio("Data source", ["All screened prompts", "Interactive (chat + prompt check)", "Batch test"],
+                      horizontal=True, key="kri_source")
+    events = {"All screened prompts": interactive + batch_events,
+              "Interactive (chat + prompt check)": interactive,
+              "Batch test": batch_events}[source]
+
+    if not events:
+        st.info("No data yet. Send messages in the Staff assistant tab, check a prompt, or run the 20-prompt "
+                "test set in the Batch test tab.")
+    else:
+        st.markdown(kri_cards_html(events), unsafe_allow_html=True)
+        decisions = Counter(e["Decision"] for e in events)
+        st.markdown(f"<div class='gw-panel'><h4>Decision split · {len(events)} prompts</h4>"
+                    f"{distribution_bar_html(decisions, len(events))}</div>", unsafe_allow_html=True)
+
+        left, right = st.columns(2, gap="large")
+        with left:
+            types = [t for e in events for t in e["_types"]]
+            items_by_cat = Counter(pii_category(t) for t in types)
+            prompts_by_cat = Counter(c for e in events for c in {pii_category(t) for t in e["_types"]})
+            cat_rows = "".join(
+                f"<tr><td class='lbl'>{html.escape(c)}{' <span class=gw-chip>high</span>' if c in HIGH_SENSITIVITY else ''}"
+                f"</td><td class='num'>{items_by_cat[c]}</td><td class='num'>{prompts_by_cat[c]}</td></tr>"
+                for c, _ in items_by_cat.most_common())
+            st.markdown(f"<div class='gw-panel'><h4>Personal data intercepted by category</h4>"
+                        f"{bar_list_html(items_by_cat.most_common(), '#DC6803')}"
+                        f"<table class='gw-table' style='margin-top:0.6rem'><tr><th>Category</th><th>Items</th>"
+                        f"<th>Prompts</th></tr>{cat_rows}</table>"
+                        f"<div class='gw-note'>Source: PII model entity labels, grouped into categories. Hong Kong "
+                        f"ID numbers are not a trained label, so they may be missed.</div></div>",
+                        unsafe_allow_html=True)
+            with st.expander("Detail by data type (model labels)"):
+                st.dataframe(pd.DataFrame(Counter(types).most_common(), columns=["Data type", "Items"])
+                             if types else pd.DataFrame(columns=["Data type", "Items"]),
+                             hide_index=True, use_container_width=True)
+        with right:
+            blocked = [e for e in events if e["Decision"] == "BLOCK"]
+            bands = Counter(e["_band"] for e in blocked)
+            band_pairs = [(label, bands[label]) for label, _ in CONFIDENCE_BANDS if bands[label]]
+            techniques = Counter(t for e in blocked for t in e["_techniques"])
+            st.markdown(f"<div class='gw-panel'><h4>Prompt-injection attempts · {len(blocked)} blocked</h4>"
+                        f"<div class='gw-muted'>Model confidence</div>{bar_list_html(band_pairs, '#B42318')}"
+                        f"<div class='gw-muted' style='margin-top:0.7rem'>Technique (indicative)</div>"
+                        f"{bar_list_html(techniques.most_common(), '#13315C')}"
+                        f"<div class='gw-note'>The fine-tuned model only decides injection or safe. Technique tags "
+                        f"come from keyword rules applied after the model blocks a prompt; one prompt can have "
+                        f"several tags.</div></div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='gw-note'>KRI limits are illustrative for this proof of concept; PrimeCredit "
+                    "would set its own risk appetite. The built-in test set is deliberately attack-heavy, so "
+                    "its KRIs show red.</div>", unsafe_allow_html=True)
+
 # ----- Audit log: decisions in this session -----
 with tab_audit:
     st.markdown("#### Audit log")
-    st.caption("Every interactive check in this session (staff assistant and prompt check). Only masked text is "
-               "stored, so personal data is not kept in the log. Batch tests are reported in the Batch test tab.")
+    st.caption("Every interactive check in this session (staff assistant and prompt check), newest first, in "
+               "Hong Kong time (UTC+8). Only masked text is stored, so personal data is not kept in the log. "
+               "Batch tests are reported in the Batch test and Risk dashboard tabs.")
     audit = st.session_state.get("audit", [])
     if audit:
-        log = pd.DataFrame(audit[::-1])
+        log = visible(audit[::-1])
         log["Decision"] = log["Decision"].map(lambda d: f"{DECISION_STYLE[d]['icon']} {d}")
         st.dataframe(log, hide_index=True, use_container_width=True,
                      column_config={"Injection probability": st.column_config.ProgressColumn(
                          "Injection probability", min_value=0.0, max_value=1.0, format="%.2f")})
         a_l, a_r = st.columns([1, 5])
-        a_l.download_button("⬇️ Export log", pd.DataFrame(audit).to_csv(index=False),
+        a_l.download_button("⬇️ Export log", visible(audit).to_csv(index=False),
                             file_name="gateway_audit_log.csv", mime="text/csv")
         if a_r.button("Clear log"):
             st.session_state["audit"] = []
