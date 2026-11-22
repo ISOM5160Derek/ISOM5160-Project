@@ -1,7 +1,11 @@
 """
 app.py - GenAI Prompt Gateway (Streamlit)
 
-Checks a staff prompt BEFORE it is sent to the company's internal GenAI assistant:
+Tab 1 (staff):          chat with the internal assistant; every message passes the gateway first
+Tab 2 (security team):  check one prompt in detail
+Tab 3 (governance team): batch test with a CSV to measure accuracy
+
+The gateway checks each prompt BEFORE it is sent to the company's internal GenAI assistant:
   Pipeline 1 (fine-tuned): text-classification  -> prompt injection / jailbreak?
   Pipeline 2 (pretrained): token-classification -> personal data (PII) in the prompt?
 
@@ -11,6 +15,7 @@ Decision:  BLOCK  if an injection is detected
 """
 
 import pandas as pd
+import requests
 import streamlit as st
 from transformers import pipeline
 
@@ -18,13 +23,18 @@ from transformers import pipeline
 # Settings - update the two model names after running the experiment scripts
 # ---------------------------------------------------------------------------
 COMPANY_NAME = "Example Bank (Hong Kong)"                       # replace with the chosen company
-INJECTION_MODEL = "Claudeface/prompt-gateway-injection"   # our fine-tuned model on HF Hub
+INJECTION_MODEL = "your-hf-username/prompt-gateway-injection"   # our fine-tuned model on HF Hub
 PII_MODEL = "Isotonic/distilbert_finetuned_ai4privacy_v2"       # PII model chosen in predict_base.py
 
 BLOCK_THRESHOLD = 0.5     # injection probability at or above this value -> BLOCK
 MIN_ENTITY_SCORE = 0.5    # ignore PII entities found with lower confidence
 MAX_CHARS = 1500          # longest prompt accepted (keeps inputs within the model limit)
 MAX_BATCH_ROWS = 100      # longest CSV accepted in the batch test tab
+
+# Chat tab settings
+MAX_CHAT_TURNS = 20       # messages per session sent to a live chat model (protects API credit)
+SIMULATED_REPLY = ("(Demo) Your message passed the gateway and was forwarded to the internal "
+                   "assistant. In production, the assistant's answer would appear here.")
 
 INJECTION_WORDS = ("INJECTION", "JAILBREAK", "MALICIOUS", "UNSAFE")
 # Entity types treated as personal data (same allow-list as the experiment scripts)
@@ -117,6 +127,57 @@ def validate_prompt(text):
     return None
 
 
+def get_assistant_settings():
+    """Optional live chat model, read from Streamlit secrets (OpenAI-compatible API).
+    If the secrets are missing, the chat tab uses a simulated reply."""
+    try:
+        return {"api_key": st.secrets["ASSISTANT_API_KEY"],
+                "base_url": st.secrets["ASSISTANT_BASE_URL"].rstrip("/"),
+                "model": st.secrets["ASSISTANT_MODEL"]}
+    except Exception:
+        return None
+
+
+def assistant_reply(message, settings):
+    """Answer from the downstream assistant. Only called for prompts the gateway ALLOWED."""
+    if settings is None:
+        return SIMULATED_REPLY
+    try:
+        response = requests.post(
+            f"{settings['base_url']}/chat/completions",
+            headers={"Authorization": f"Bearer {settings['api_key']}"},
+            json={"model": settings["model"], "max_tokens": 300,
+                  "messages": [{"role": "system",
+                                "content": f"You are the internal assistant of {COMPANY_NAME}. "
+                                           "Answer briefly and professionally."},
+                               {"role": "user", "content": message}]},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    except Exception:
+        return SIMULATED_REPLY + "\n\n(The live assistant could not be reached, so a demo reply is shown.)"
+
+
+def gateway_chat_reply(message, injection_clf, pii_ner, settings):
+    """Return (text to keep in the chat history, assistant reply) for one staff message."""
+    result = check_prompt(message, injection_clf, pii_ner)
+    if result["decision"] == "BLOCK":
+        return message, ("🚫 **Blocked by the gateway.** This message looks like an attempt to "
+                         f"override the assistant's rules ({result['injection_prob']:.0%} confidence). "
+                         "It was not sent. Contact the AI governance team if you think this is wrong.")
+    if result["decision"] == "REVIEW":
+        masked = mask_text(message, result["entities"])
+        types = ", ".join(sorted({clean_label(e["entity_group"]) for e in result["entities"]}))
+        # Only the masked text is kept in the chat history, so personal data is not stored
+        return masked, ("⚠️ **Not sent: personal data found** (" + types + "). "
+                        "Please remove it and send again. Masked version:\n\n> " + masked)
+    if settings is not None and st.session_state.get("turns", 0) >= MAX_CHAT_TURNS:
+        return message, "✅ Passed the gateway, but the demo message limit for this session was reached."
+    st.session_state["turns"] = st.session_state.get("turns", 0) + 1
+    return message, "✅ *Passed the gateway.*\n\n" + assistant_reply(message, settings)
+
+
 # ---------------------------------------------------------------------------
 # Page layout
 # ---------------------------------------------------------------------------
@@ -137,9 +198,39 @@ except Exception as err:
     st.error(f"The models could not be loaded. Please check the model names in app.py. Details: {err}")
     st.stop()
 
-tab_single, tab_batch = st.tabs(["Check a prompt", "Batch test (CSV)"])
+tab_chat, tab_single, tab_batch = st.tabs(["Staff assistant (chat)", "Check a prompt", "Batch test (CSV)"])
 
-# ----- Tab 1: one prompt -----
+# ----- Tab 1: staff chat, every message goes through the gateway first -----
+with tab_chat:
+    settings = get_assistant_settings()
+    st.caption("Every message is checked by the gateway before it reaches the assistant. "
+               "Assistant mode: " + ("live chat model" if settings else "simulated reply (demo)"))
+    if "chat" not in st.session_state:
+        st.session_state["chat"] = []        # list of {"role": ..., "content": ...}
+
+    for msg in st.session_state["chat"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    user_msg = st.chat_input("Type your message to the assistant")
+    if user_msg:
+        error = validate_prompt(user_msg)
+        if error:
+            st.warning(error)
+        else:
+            try:
+                shown, reply = gateway_chat_reply(user_msg, injection_clf, pii_ner, settings)
+            except Exception as err:
+                shown, reply = user_msg, f"Something went wrong while checking the message: {err}"
+            st.session_state["chat"] += [{"role": "user", "content": shown},
+                                         {"role": "assistant", "content": reply}]
+            st.rerun()
+
+    if st.session_state["chat"] and st.button("Clear chat"):
+        st.session_state["chat"] = []
+        st.rerun()
+
+# ----- Tab 2: one prompt in detail (security analyst) -----
 with tab_single:
     prompt = st.text_area("Paste the prompt that will be sent to the GenAI assistant:", height=150)
     if st.button("Check prompt", type="primary"):
@@ -178,7 +269,7 @@ with tab_single:
                 st.subheader("Masked version of the prompt")
                 st.code(mask_text(prompt, entities), language=None)
 
-# ----- Tab 2: batch test for live-app evaluation -----
+# ----- Tab 3: batch test for live-app evaluation (governance team) -----
 with tab_batch:
     st.write("Upload a CSV with a **text** column. Optional columns **expected_injection** and "
              "**expected_pii** (0 or 1) are used to calculate accuracy.")

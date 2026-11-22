@@ -3,5 +3,6 @@ torch
 transformers>=4.44,<5
 streamlit>=1.36
 pandas
+requests
 sentencepiece
 protobuf
