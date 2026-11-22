@@ -17,13 +17,14 @@ Decision:  BLOCK  if an injection is detected
 import pandas as pd
 import requests
 import streamlit as st
+import torch
 from transformers import pipeline
 
 # ---------------------------------------------------------------------------
 # Settings - update the two model names after running the experiment scripts
 # ---------------------------------------------------------------------------
 COMPANY_NAME = "Example Bank (Hong Kong)"                       # replace with the chosen company
-INJECTION_MODEL = "Claudeface/prompt-gateway-injection"   # our fine-tuned model on HF Hub
+INJECTION_MODEL = "Claudeface/prompt-gateway-injection"         # our fine-tuned model on HF Hub
 PII_MODEL = "Isotonic/distilbert_finetuned_ai4privacy_v2"       # PII model chosen in predict_base.py
 
 BLOCK_THRESHOLD = 0.5     # injection probability at or above this value -> BLOCK
@@ -32,7 +33,10 @@ MAX_CHARS = 1500          # longest prompt accepted (keeps inputs within the mod
 MAX_BATCH_ROWS = 100      # longest CSV accepted in the batch test tab
 
 # Chat tab settings
-MAX_CHAT_TURNS = 20       # messages per session sent to a live chat model (protects API credit)
+USE_LOCAL_ASSISTANT = True    # small Hugging Face chat model as the demo assistant
+LOCAL_ASSISTANT_MODEL = "HuggingFaceTB/SmolLM2-360M-Instruct"
+MAX_REPLY_TOKENS = 150        # keeps replies short and fast on Streamlit's CPU
+MAX_CHAT_TURNS = 20       # messages per session sent to an external chat API (protects API credit)
 SIMULATED_REPLY = ("(Demo) Your message passed the gateway and was forwarded to the internal "
                    "assistant. In production, the assistant's answer would appear here.")
 
@@ -138,25 +142,41 @@ def get_assistant_settings():
         return None
 
 
+@st.cache_resource(show_spinner="Loading the demo assistant (first time only) ...")
+def load_local_assistant():
+    """Small instruction-tuned model, loaded in bfloat16 to halve its memory use."""
+    return pipeline("text-generation", model=LOCAL_ASSISTANT_MODEL, torch_dtype=torch.bfloat16)
+
+
+def system_message():
+    return {"role": "system",
+            "content": f"You are the internal assistant of {COMPANY_NAME}. Answer briefly and professionally."}
+
+
 def assistant_reply(message, settings):
-    """Answer from the downstream assistant. Only called for prompts the gateway ALLOWED."""
-    if settings is None:
-        return SIMULATED_REPLY
-    try:
-        response = requests.post(
-            f"{settings['base_url']}/chat/completions",
-            headers={"Authorization": f"Bearer {settings['api_key']}"},
-            json={"model": settings["model"], "max_tokens": 300,
-                  "messages": [{"role": "system",
-                                "content": f"You are the internal assistant of {COMPANY_NAME}. "
-                                           "Answer briefly and professionally."},
-                               {"role": "user", "content": message}]},
-            timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except Exception:
-        return SIMULATED_REPLY + "\n\n(The live assistant could not be reached, so a demo reply is shown.)"
+    """Answer from the downstream assistant. Only called for prompts the gateway ALLOWED.
+    Order: external chat API (if secrets are set) -> local HF model -> simulated reply."""
+    messages = [system_message(), {"role": "user", "content": message}]
+    if settings is not None:
+        try:
+            response = requests.post(
+                f"{settings['base_url']}/chat/completions",
+                headers={"Authorization": f"Bearer {settings['api_key']}"},
+                json={"model": settings["model"], "max_tokens": 300, "messages": messages},
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception:
+            pass   # fall back to the local model below
+    if USE_LOCAL_ASSISTANT:
+        try:
+            generator = load_local_assistant()
+            output = generator(messages, max_new_tokens=MAX_REPLY_TOKENS, do_sample=False)
+            return output[0]["generated_text"][-1]["content"].strip()
+        except Exception:
+            pass   # fall back to the simulated reply below
+    return SIMULATED_REPLY
 
 
 def gateway_chat_reply(message, injection_clf, pii_ner, settings):
@@ -175,7 +195,9 @@ def gateway_chat_reply(message, injection_clf, pii_ner, settings):
     if settings is not None and st.session_state.get("turns", 0) >= MAX_CHAT_TURNS:
         return message, "✅ Passed the gateway, but the demo message limit for this session was reached."
     st.session_state["turns"] = st.session_state.get("turns", 0) + 1
-    return message, "✅ *Passed the gateway.*\n\n" + assistant_reply(message, settings)
+    with st.spinner("Assistant is writing a reply ..."):
+        reply = assistant_reply(message, settings)
+    return message, "✅ *Passed the gateway.*\n\n" + reply
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +226,9 @@ tab_chat, tab_single, tab_batch = st.tabs(["Staff assistant (chat)", "Check a pr
 with tab_chat:
     settings = get_assistant_settings()
     st.caption("Every message is checked by the gateway before it reaches the assistant. "
-               "Assistant mode: " + ("live chat model" if settings else "simulated reply (demo)"))
+               "Assistant mode: " + ("external chat model" if settings else
+                                     f"demo model {LOCAL_ASSISTANT_MODEL}" if USE_LOCAL_ASSISTANT
+                                     else "simulated reply"))
     if "chat" not in st.session_state:
         st.session_state["chat"] = []        # list of {"role": ..., "content": ...}
 
