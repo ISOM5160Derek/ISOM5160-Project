@@ -23,7 +23,7 @@ from transformers import pipeline
 # Settings - update the two model names after running the experiment scripts
 # ---------------------------------------------------------------------------
 COMPANY_NAME = "Example Bank (Hong Kong)"                       # replace with the chosen company
-INJECTION_MODEL = "your-hf-username/prompt-gateway-injection"   # our fine-tuned model on HF Hub
+INJECTION_MODEL = "Claudeface/prompt-gateway-injection"   # our fine-tuned model on HF Hub
 PII_MODEL = "Isotonic/distilbert_finetuned_ai4privacy_v2"       # PII model chosen in predict_base.py
 
 BLOCK_THRESHOLD = 0.5     # injection probability at or above this value -> BLOCK
