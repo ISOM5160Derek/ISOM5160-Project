@@ -284,6 +284,17 @@ def trace_line(result):
             f"{pii} · checked in {total:.2f}s</div>")
 
 
+def fill_draft(text):
+    """Example button: put the example text into the message box (not sent yet)."""
+    st.session_state["draft"] = text
+
+
+def send_draft():
+    """Send button: move the message box text to the send queue and empty the box."""
+    st.session_state["to_send"] = st.session_state.get("draft", "")
+    st.session_state["draft"] = ""
+
+
 # ---------------------------------------------------------------------------
 # Page layout
 # ---------------------------------------------------------------------------
@@ -328,17 +339,17 @@ with tab_chat:
     if "chat" not in st.session_state:
         st.session_state["chat"] = []        # list of {"role", "content", "trace"}
 
-    # Demo buttons: send a ready-made example message
+    # Example buttons only fill the message box, so the audience can read the
+    # original prompt before it is sent and checked
     cols = st.columns(len(EXAMPLES) + 1)
     for col, (label, text) in zip(cols, EXAMPLES.items()):
-        if col.button(label, use_container_width=True):
-            st.session_state["pending"] = text
+        col.button(label, use_container_width=True, on_click=fill_draft, args=(text,))
     if cols[-1].button("🗑️ Clear chat", use_container_width=True):
         st.session_state["chat"] = []
         st.rerun()
 
     if not st.session_state["chat"]:
-        st.info("Type a message below, or click one of the example buttons to see how the gateway responds.")
+        st.info("Type a message below, or click an example button to fill the message box, then press Send.")
 
     for msg in st.session_state["chat"]:
         with st.chat_message(msg["role"], avatar="🧑‍💼" if msg["role"] == "user" else "🛡️"):
@@ -346,7 +357,13 @@ with tab_chat:
             if msg.get("trace"):
                 st.markdown(msg["trace"], unsafe_allow_html=True)
 
-    user_msg = st.chat_input("Type your message to the assistant") or st.session_state.pop("pending", None)
+    # Message box (a form, so it can be pre-filled by the example buttons)
+    with st.form("chat_form"):
+        st.text_area("Your message", key="draft", height=100, label_visibility="collapsed",
+                     placeholder="Type your message to the assistant ... (Ctrl+Enter to send)")
+        st.form_submit_button("Send ➤", type="primary", on_click=send_draft)
+
+    user_msg = st.session_state.pop("to_send", None)
     if user_msg:
         error = validate_prompt(user_msg)
         if error:
