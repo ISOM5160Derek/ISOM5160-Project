@@ -18,7 +18,7 @@ from transformers import pipeline
 # Settings - update the two model names after running the experiment scripts
 # ---------------------------------------------------------------------------
 COMPANY_NAME = "Example Bank (Hong Kong)"                       # replace with the chosen company
-INJECTION_MODEL = "your-hf-username/prompt-gateway-injection"   # our fine-tuned model on HF Hub
+INJECTION_MODEL = "Claudeface/prompt-gateway-injection"   # our fine-tuned model on HF Hub
 PII_MODEL = "Isotonic/distilbert_finetuned_ai4privacy_v2"       # PII model chosen in predict_base.py
 
 BLOCK_THRESHOLD = 0.5     # injection probability at or above this value -> BLOCK
@@ -27,10 +27,15 @@ MAX_CHARS = 1500          # longest prompt accepted (keeps inputs within the mod
 MAX_BATCH_ROWS = 100      # longest CSV accepted in the batch test tab
 
 INJECTION_WORDS = ("INJECTION", "JAILBREAK", "MALICIOUS", "UNSAFE")
-NON_PII_LABELS = {
-    "ORG", "MISC", "COMPANYNAME", "JOBAREA", "JOBTITLE", "JOBTYPE",
-    "CURRENCY", "CURRENCYCODE", "CURRENCYNAME", "CURRENCYSYMBOL",
-    "AMOUNT", "DATE", "TIME", "ORDINALDIRECTION",
+# Entity types treated as personal data (same allow-list as the experiment scripts)
+PII_LABELS = {
+    "PER", "NAME", "FULLNAME", "FIRSTNAME", "MIDDLENAME", "LASTNAME",
+    "EMAIL", "PHONENUMBER", "PHONE_NUMBER", "PHONEIMEI", "USERNAME", "PASSWORD",
+    "ACCOUNTNAME", "ACCOUNTNUMBER", "IBAN", "BIC", "CREDITCARDNUMBER",
+    "CREDITCARDCVV", "MASKEDNUMBER", "PIN", "SSN", "DOB",
+    "STREET", "STREETADDRESS", "BUILDINGNUMBER", "SECONDARYADDRESS", "ZIPCODE",
+    "IP", "IPV4", "IPV6", "MAC", "NEARBYGPSCOORDINATE",
+    "BITCOINADDRESS", "ETHEREUMADDRESS", "LITECOINADDRESS", "VEHICLEVIN", "VEHICLEVRM",
 }
 
 
@@ -80,7 +85,7 @@ def find_pii(ner, text):
     """List of personal data entities found in the prompt."""
     entities = ner(text)
     return [e for e in entities
-            if e["score"] >= MIN_ENTITY_SCORE and clean_label(e["entity_group"]) not in NON_PII_LABELS]
+            if e["score"] >= MIN_ENTITY_SCORE and clean_label(e["entity_group"]) in PII_LABELS]
 
 
 def mask_text(text, entities):
